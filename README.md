@@ -161,11 +161,11 @@ print(response.json())
 
 ## API Key
 
-API Key yang digunakan: `K81494772088957`
+API Key yang digunakan: `--`
 
 Anda dapat mengganti API key di file `server.js` pada baris:
 ```javascript
-const API_KEY = 'K81494772088957';
+const API_KEY = '--';
 ```
 
 ## Error Handling
