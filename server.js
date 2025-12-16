@@ -416,7 +416,7 @@ app.get('/', (req, res) => {
   });
 });
 
-app.listen(port, () => {
+app.listen(port,'127.0.0.1', () => {
   console.log(`KTP NIK Extractor API running on http://localhost:${port}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`CORS Origin: ${CORS_ORIGIN}`);
