@@ -14,6 +14,11 @@ const port = process.env.PORT || 3000;
 const API_KEY = process.env.OCR_API_KEY || 'helloworld';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
 
+// Configuration
+const MAX_FILE_SIZE = 1024 * 1024; // 1024 KB max for OCR Space
+const COMPRESSION_QUALITY = 80; // JPEG quality (1-100)
+const MAX_DIMENSION = 2000; // Max width/height after resize
+
 // Middleware
 app.use(cors({
   origin: CORS_ORIGIN,
@@ -27,6 +32,52 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 }
 });
+
+/**
+ * Compress image buffer to be under MAX_FILE_SIZE (1024 KB)
+ * @param {Buffer} imageBuffer Image buffer
+ * @param {string} mimeType MIME type of image
+ * @return {Promise<Buffer>} Compressed image buffer
+ */
+async function compressImage(imageBuffer, mimeType = 'image/jpeg') {
+  try {
+    let compressed = imageBuffer;
+    let quality = COMPRESSION_QUALITY;
+    let maxDimension = MAX_DIMENSION;
+    let attempts = 0;
+    const maxAttempts = 5;
+    
+    while (compressed.length > MAX_FILE_SIZE && attempts < maxAttempts) {
+      attempts++;
+      console.log(`Compression attempt ${attempts}: Size ${(compressed.length / 1024).toFixed(2)} KB, Quality: ${quality}, MaxDim: ${maxDimension}`);
+      
+      // Reduce quality and dimensions progressively
+      compressed = await sharp(compressed)
+        .resize(maxDimension, maxDimension, {
+          fit: 'inside',
+          withoutEnlargement: true
+        })
+        .jpeg({ quality: quality, progressive: true })
+        .toBuffer();
+      
+      quality -= 10;
+      maxDimension = Math.floor(maxDimension * 0.9);
+    }
+    
+    const finalSize = (compressed.length / 1024).toFixed(2);
+    console.log(`Image compressed to ${finalSize} KB (from ${(imageBuffer.length / 1024).toFixed(2)} KB)`);
+    
+    if (compressed.length > MAX_FILE_SIZE) {
+      console.warn(`⚠️  Warning: Compressed image (${finalSize} KB) still exceeds limit, but sending anyway`);
+    }
+    
+    return compressed;
+  } catch (error) {
+    console.error('Compression error:', error);
+    // Return original if compression fails
+    return imageBuffer;
+  }
+}
 
 /**
  * Extract NIK from OCR text
@@ -116,10 +167,43 @@ app.post('/extract-nik', async (req, res) => {
     }
     
     let input = image;
+    let isBase64 = type === 'base64' || image.startsWith('data:');
     
-    // Add base64 prefix if needed
-    if (type === 'base64' && !image.startsWith('data:')) {
-      input = `data:image/jpeg;base64,${image}`;
+    // Process base64 image: compress if needed
+    if (isBase64) {
+      try {
+        // Extract base64 data
+        let base64Data = image;
+        let mimeType = 'image/jpeg';
+        
+        if (image.startsWith('data:')) {
+          const matches = image.match(/data:([^;]+);base64,(.+)/);
+          if (matches) {
+            mimeType = matches[1];
+            base64Data = matches[2];
+          }
+        }
+        
+        // Convert to buffer
+        const imageBuffer = Buffer.from(base64Data, 'base64');
+        console.log(`Original size: ${(imageBuffer.length / 1024).toFixed(2)} KB`);
+        
+        // Compress if needed
+        if (imageBuffer.length > MAX_FILE_SIZE) {
+          const compressedBuffer = await compressImage(imageBuffer, mimeType);
+          const compressedBase64 = compressedBuffer.toString('base64');
+          input = `data:${mimeType};base64,${compressedBase64}`;
+        } else if (!image.startsWith('data:')) {
+          // Add data prefix if missing
+          input = `data:${mimeType};base64,${base64Data}`;
+        }
+      } catch (compressionError) {
+        console.error('Base64 compression error:', compressionError);
+        // Continue with original if compression fails
+        if (!image.startsWith('data:')) {
+          input = `data:image/jpeg;base64,${image}`;
+        }
+      }
     }
     
     // Call OCR Space API
@@ -180,6 +264,7 @@ app.post('/extract', upload.single('file'), async (req, res) => {
     const cropHeight = parseInt(req.query.cropHeight || '100'); // Default 100px (optimal untuk NIK)
     
     let imageBuffer = req.file.buffer;
+    console.log(`Uploaded file size: ${(imageBuffer.length / 1024).toFixed(2)} KB`);
     
     // Crop image if requested
     if (shouldCrop) {
@@ -192,6 +277,12 @@ app.post('/extract', upload.single('file'), async (req, res) => {
         console.error('Crop error:', cropError);
         // Continue dengan original image jika crop gagal
       }
+    }
+    
+    // Compress image if size exceeds limit
+    if (imageBuffer.length > MAX_FILE_SIZE) {
+      console.log(`File size (${(imageBuffer.length / 1024).toFixed(2)} KB) exceeds limit, compressing...`);
+      imageBuffer = await compressImage(imageBuffer, req.file.mimetype || 'image/jpeg');
     }
     
     // Convert buffer to base64
@@ -297,7 +388,7 @@ app.get('/', (req, res) => {
     name: 'KTP NIK Extractor API',
     version: '1.0.0',
     endpoints: {
-      'POST /extract-nik': {
+      'POST /extract': {
         description: 'Extract NIK from KTP image using base64 or URL',
         body: {
           image: 'Base64 string or image URL (required)',
