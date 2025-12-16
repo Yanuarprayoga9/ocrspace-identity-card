@@ -49,7 +49,6 @@ async function compressImage(imageBuffer, mimeType = 'image/jpeg') {
     
     while (compressed.length > MAX_FILE_SIZE && attempts < maxAttempts) {
       attempts++;
-      console.log(`Compression attempt ${attempts}: Size ${(compressed.length / 1024).toFixed(2)} KB, Quality: ${quality}, MaxDim: ${maxDimension}`);
       
       // Reduce quality and dimensions progressively
       compressed = await sharp(compressed)
@@ -64,16 +63,8 @@ async function compressImage(imageBuffer, mimeType = 'image/jpeg') {
       maxDimension = Math.floor(maxDimension * 0.9);
     }
     
-    const finalSize = (compressed.length / 1024).toFixed(2);
-    console.log(`Image compressed to ${finalSize} KB (from ${(imageBuffer.length / 1024).toFixed(2)} KB)`);
-    
-    if (compressed.length > MAX_FILE_SIZE) {
-      console.warn(`⚠️  Warning: Compressed image (${finalSize} KB) still exceeds limit, but sending anyway`);
-    }
-    
     return compressed;
   } catch (error) {
-    console.error('Compression error:', error);
     // Return original if compression fails
     return imageBuffer;
   }
@@ -81,7 +72,8 @@ async function compressImage(imageBuffer, mimeType = 'image/jpeg') {
 
 /**
  * Extract NIK from OCR text
- * Pattern: NIK is 16 digits (bisa terpisah dengan spasi atau dash)
+ * Pattern: NIK is EXACTLY 16 digits (tidak boleh lebih dan kurang)
+ * Prioritas: NIK label → first digit sequence exactly 16 digits
  */
 function extractNIK(text) {
   if (!text) return null;
@@ -89,20 +81,46 @@ function extractNIK(text) {
   // Normalize: remove newlines, normalize spaces
   let cleanText = text.replace(/[\n\r]+/g, ' ').replace(/\s+/g, ' ').trim();
   
-  // Try to find all digit sequences that could be NIK
-  const digitSequences = cleanText.match(/\d+/g) || [];
-  
-  for (const seq of digitSequences) {
-    const cleaned = seq.replace(/[\s\-]/g, '');
-    if (cleaned.length === 16 && /^\d{16}$/.test(cleaned)) {
-      return cleaned;
+  // Method 1: Look for "NIK" label followed by exactly 16 digits
+  // This is the MOST RELIABLE method
+  const nikLabelMatch = cleanText.match(/NIK\s*[:.\s\-]*\s*(\d{1,3}[\s\-]?\d{1,3}[\s\-]?\d{1,3}[\s\-]?\d{1,3}[\s\-]?\d{1,3}[\s\-]?\d{1,3}[\s\-]?\d{1,3}[\s\-]?\d{1,3})/i);
+  if (nikLabelMatch) {
+    const rawNik = nikLabelMatch[1];
+    const nik = rawNik.replace(/[\s\-]/g, '');
+    
+    // Strictly EXACTLY 16 digits
+    if (nik.length === 16 && /^\d{16}$/.test(nik)) {
+      return nik;
     }
   }
   
-  // Pattern: "NIK" followed by digits (with any separators)
-  let nikMatch = cleanText.match(/NIK\s*[:.\s\-]*\s*(\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d)/i);
-  if (nikMatch) {
-    return nikMatch[1].replace(/[\s\-]/g, '');
+  // Method 2: Find ALL 16-digit sequences in the text and return FIRST one found
+  // (usually the first significant number on KTP is the NIK)
+  const allDigitsPattern = cleanText.match(/(\d[\s\-]*){15,}\d/g);
+  if (allDigitsPattern) {
+    for (const match of allDigitsPattern) {
+      const nik = match.replace(/\D/g, '');
+      
+      // Strictly EXACTLY 16 digits
+      if (nik.length === 16 && /^\d{16}$/.test(nik)) {
+        return nik;
+      } else if (nik.length > 16) {
+        // If we have more than 16, take first 16 only if they look like NIK
+        const first16 = nik.substring(0, 16);
+        if (/^\d{16}$/.test(first16)) {
+          return first16;
+        }
+      }
+    }
+  }
+  
+  // Method 3: Split by spaces and find first 16-digit number
+  const words = cleanText.split(/[\s\-]+/);
+  for (const word of words) {
+    const nik = word.replace(/\D/g, '');
+    if (nik.length === 16 && /^\d{16}$/.test(nik)) {
+      return nik;
+    }
   }
   
   return null;
@@ -186,7 +204,6 @@ app.post('/extract-nik', async (req, res) => {
         
         // Convert to buffer
         const imageBuffer = Buffer.from(base64Data, 'base64');
-        console.log(`Original size: ${(imageBuffer.length / 1024).toFixed(2)} KB`);
         
         // Compress if needed
         if (imageBuffer.length > MAX_FILE_SIZE) {
@@ -198,7 +215,6 @@ app.post('/extract-nik', async (req, res) => {
           input = `data:${mimeType};base64,${base64Data}`;
         }
       } catch (compressionError) {
-        console.error('Base64 compression error:', compressionError);
         // Continue with original if compression fails
         if (!image.startsWith('data:')) {
           input = `data:image/jpeg;base64,${image}`;
@@ -235,7 +251,6 @@ app.post('/extract-nik', async (req, res) => {
       });
     }
   } catch (error) {
-    console.error('Error:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error',
@@ -248,8 +263,8 @@ app.post('/extract-nik', async (req, res) => {
  * POST /extract-nik-file
  * Extract NIK from uploaded KTP file
  * Query params:
- * - crop=true: Crop bagian atas untuk fokus NIK
- * - cropHeight=100: Tinggi crop dari atas (default: 150)
+ * - crop=true: Crop bagian atas untuk fokus NIK (optional, disabled by default for better accuracy)
+ * - cropHeight=100: Tinggi crop dari atas (default: 100px)
  */
 app.post('/extract', upload.single('file'), async (req, res) => {
   try {
@@ -260,28 +275,24 @@ app.post('/extract', upload.single('file'), async (req, res) => {
       });
     }
     
-    const shouldCrop = req.query.crop === 'true';
-    const cropHeight = parseInt(req.query.cropHeight || '100'); // Default 100px (optimal untuk NIK)
+    const shouldCrop = req.query.crop === 'true'; // Disabled by default
+    const cropHeight = parseInt(req.query.cropHeight || '100');
     
     let imageBuffer = req.file.buffer;
-    console.log(`Uploaded file size: ${(imageBuffer.length / 1024).toFixed(2)} KB`);
     
-    // Crop image if requested
+    // Crop image only if explicitly requested
     if (shouldCrop) {
       try {
         imageBuffer = await sharp(req.file.buffer)
           .extract({ left: 0, top: 0, width: null, height: cropHeight })
           .toBuffer();
-        console.log(`Image cropped to height: ${cropHeight}px`);
       } catch (cropError) {
-        console.error('Crop error:', cropError);
         // Continue dengan original image jika crop gagal
       }
     }
     
     // Compress image if size exceeds limit
     if (imageBuffer.length > MAX_FILE_SIZE) {
-      console.log(`File size (${(imageBuffer.length / 1024).toFixed(2)} KB) exceeds limit, compressing...`);
       imageBuffer = await compressImage(imageBuffer, req.file.mimetype || 'image/jpeg');
     }
     
@@ -319,7 +330,6 @@ app.post('/extract', upload.single('file'), async (req, res) => {
       });
     }
   } catch (error) {
-    console.error('Error:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error',
